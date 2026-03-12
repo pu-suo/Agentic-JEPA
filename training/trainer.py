@@ -2,10 +2,12 @@
 Main training loop for Agentic JEPA.
 
 Per-step training flow:
-  1. Encode pre_action_text with Context Encoder → h_t
+  1. Encode context_before_action with Context Encoder → h_t
   2. Encode action_text with Context Encoder → action_embed
   3. Run Afterstate Predictor (ACT) → as_t, n_steps, halt_probs
-  4. Encode pre_action_text with EMA Target Encoder → ema_target (stop-gradient)
+  4. Encode context_after_action with EMA Target Encoder → ema_target (stop-gradient)
+     NOTE: context_after_action includes the action but NOT the observation.
+           This is the correct afterstate target boundary.
   5. Compute JEPA loss: cosine_distance(as_t, sg[ema_target]) weighted by tau
   6. Run Value Head on as_t → v_afterstate
   7. Encode observation_text with Context Encoder → obs_embed
@@ -117,10 +119,10 @@ class AgenticJEPATrainer:
             return None
 
         return {
-            "pre_action_text": [t for t, m in zip(batch["pre_action_text"], mask) if m],
+            "context_before_action": [t for t, m in zip(batch["context_before_action"], mask) if m],
+            "context_after_action": [t for t, m in zip(batch["context_after_action"], mask) if m],
             "action_text": [t for t, m in zip(batch["action_text"], mask) if m],
             "observation_text": [t for t, m in zip(batch["observation_text"], mask) if m],
-            "post_observation_text": [t for t, m in zip(batch["post_observation_text"], mask) if m],
             "tau": batch["tau"][mask],
             "reward": batch["reward"][mask],
             "is_terminal": [t for t, m in zip(batch["is_terminal"], mask) if m],
@@ -145,15 +147,17 @@ class AgenticJEPATrainer:
         self.optimizer.zero_grad()
 
         # === Step 1-2: Encode context and action ===
-        h_t = self.encoder(batch["pre_action_text"])          # (B, d)
+        h_t = self.encoder(batch["context_before_action"])    # (B, d) — state BEFORE action
         action_embed = self.encoder(batch["action_text"])      # (B, d)
 
         # === Step 3: Afterstate Predictor (ACT) ===
         as_t, n_steps, halt_probs = self.predictor(h_t, action_embed)
 
         # === Step 4: EMA target (stop-gradient) ===
+        # context_after_action includes the action but NOT the observation —
+        # this is the correct afterstate target boundary.
         with torch.no_grad():
-            ema_target = self.ema_encoder(batch["pre_action_text"])  # (B, d)
+            ema_target = self.ema_encoder(batch["context_after_action"])  # (B, d)
 
         # === Step 5: JEPA loss ===
         l_jepa = jepa_loss(as_t, ema_target, tau)
@@ -223,11 +227,11 @@ class AgenticJEPATrainer:
         for batch in val_loader:
             tau = batch["tau"].to(self.device)
 
-            h_t = self.encoder(batch["pre_action_text"])
+            h_t = self.encoder(batch["context_before_action"])
             action_embed = self.encoder(batch["action_text"])
             as_t, n_steps, _ = self.predictor(h_t, action_embed)
 
-            ema_target = self.ema_encoder(batch["pre_action_text"])
+            ema_target = self.ema_encoder(batch["context_after_action"])
             l_jepa = jepa_loss(as_t, ema_target, tau)
 
             obs_embed = self.encoder(batch["observation_text"])
@@ -329,7 +333,7 @@ class AgenticJEPATrainer:
             for batch in train_loader:
                 # Get latent state for each action
                 with torch.no_grad():
-                    h_t = self.encoder(batch["pre_action_text"])
+                    h_t = self.encoder(batch["context_before_action"])
                     action_embed = self.encoder(batch["action_text"])
                     as_t, _, _ = self.predictor(h_t, action_embed)
 

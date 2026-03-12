@@ -1,157 +1,255 @@
 """
 CodeActInstruct Data Loader for Agentic JEPA.
 
-Each trajectory is parsed into a sequence of (context, action, observation, reward) tuples.
+Downloads and parses the xingyaoww/code-act dataset from HuggingFace.
+
+CRITICAL: Real dataset schema differences from initial assumptions:
+  - Environment observations come as "user" role (NOT "environment" role)
+  - Actions are inside <execute>...</execute> tags within "assistant" messages
+  - There is NO reward field — reward must be inferred from trajectory outcomes
+  - Roles observed: "system", "user", "assistant" only
 
 CRITICAL: The afterstate target boundary.
 ==================================================
-The JEPA loss trains the predictor to match the EMA encoding of the
-PRE-OBSERVATION state — the state AFTER the agent's action but BEFORE
-the environment responds.
+Two context fields are produced per step:
 
-In CodeActInstruct, turns alternate:
-  - Assistant message (code action a_t)
-  - Environment message (terminal output o_t)
+  context_before_action: system + c_0 + a_1 + o_1 + ... + a_{t-1} + o_{t-1}
+                         (EXCLUDES current action a_t)
+                         → used as h_t input to the Context Encoder
 
-The afterstate target for step t encodes:
-  context = concat(c_0, a_1, o_1, ..., a_{t-1}, o_{t-1}, a_t)
-                                                           ^^^^
-                                        INCLUDES the current action
+  context_after_action:  system + c_0 + a_1 + o_1 + ... + a_{t-1} + o_{t-1} + a_t
+                         (INCLUDES current action, EXCLUDES current observation o_t)
+                         → used as the EMA Target Encoder input for the afterstate target
 
-  NOT:
-  context = concat(c_0, a_1, o_1, ..., a_t, o_t)
-                                             ^^^^
-                              EXCLUDES the current observation
-
-If this boundary is wrong, the entire afterstate factorization is
-invalidated and the Fréchet mean gradient pathology returns.
+If this boundary is wrong, the JEPA target degenerates to a trivial
+identity mapping and the entire factorization is invalidated.
 ==================================================
 """
-import json
+import re
+import logging
+import random
+from dataclasses import dataclass
+from typing import List, Optional
+
 import torch
 from torch.utils.data import Dataset, DataLoader
-from typing import List, Optional
+
 from data.action_classifier import classify_action
 
+logger = logging.getLogger(__name__)
 
+EXECUTE_RE = re.compile(r'<execute>(.*?)</execute>', re.DOTALL)
+SOLUTION_RE = re.compile(r'<solution>(.*?)</solution>', re.DOTALL)
+
+
+@dataclass
 class TrajectoryStep:
-    """A single (action, observation) step in a trajectory."""
-    def __init__(self, action_text: str, observation_text: str,
-                 action_type_weight: float):
-        self.action_text = action_text
-        self.observation_text = observation_text
-        self.tau = action_type_weight  # τ(a_t) for JEPA loss weighting
+    """A single (action, observation) step."""
+    action_text: str       # Full assistant message (may contain <execute> and <solution> tags)
+    action_code: str       # Extracted code from <execute> tags (for classification)
+    observation_text: str  # The subsequent user message (environment output)
+    tau: float             # Action-type weight from classify_action()
 
 
+@dataclass
 class Trajectory:
-    """A complete trajectory: initial context, sequence of steps, final reward."""
-    def __init__(self, context: str, steps: List[TrajectoryStep], reward: float):
-        self.context = context
-        self.steps = steps
-        self.reward = reward  # Binary: 1.0 = task solved, 0.0 = failed
+    """A complete trajectory."""
+    id: str
+    context: str           # Initial task (first user message after system)
+    system_prompt: str     # System message content (if present, else "")
+    steps: List[TrajectoryStep]
+    reward: float          # Inferred binary reward (1.0 = success, 0.0 = failure)
 
 
-def parse_codeact_trajectory(raw: dict) -> Optional[Trajectory]:
+def extract_code_blocks(assistant_content: str) -> str:
     """
-    Parse a single CodeActInstruct trajectory JSON into our format.
-
-    Expected structure (adapt to actual dataset format):
-    {
-        "conversations": [
-            {"role": "user", "content": "..."},        # c_0
-            {"role": "assistant", "content": "..."},    # a_1 (Python code)
-            {"role": "environment", "content": "..."},  # o_1 (terminal output)
-            {"role": "assistant", "content": "..."},    # a_2
-            {"role": "environment", "content": "..."},  # o_2
-            ...
-        ],
-        "reward": 1  # or 0
-    }
-
-    Adapt the parsing logic to match the actual CodeActInstruct schema.
+    Extract code from <execute> tags.
+    Returns concatenated code blocks, or the full content if no tags found.
     """
-    convos = raw.get("conversations", [])
-    if len(convos) < 3:
+    blocks = EXECUTE_RE.findall(assistant_content)
+    if blocks:
+        return "\n".join(b.strip() for b in blocks)
+    return assistant_content
+
+
+def infer_reward(conversations: list) -> float:
+    """
+    Infer binary reward from trajectory conversations.
+
+    Success (1.0): Trajectory contains a <solution> tag AND the final user
+                   message does not indicate "your answer is wrong".
+    Failure (0.0): Otherwise.
+    """
+    has_solution = False
+    last_user_content = ""
+
+    for msg in conversations:
+        if msg["role"] == "assistant" and SOLUTION_RE.search(msg["content"]):
+            has_solution = True
+        if msg["role"] == "user":
+            last_user_content = msg["content"]
+
+    if not has_solution:
+        return 0.0
+    if "your answer is wrong" in last_user_content.lower():
+        return 0.0
+    return 1.0
+
+
+def parse_codeact_trajectory(row: dict) -> Optional[Trajectory]:
+    """
+    Parse a single CodeActInstruct row into a Trajectory.
+
+    Handles the real dataset schema:
+      - Roles: "system", "user", "assistant"
+      - First "user" after optional "system" = initial task context c_0
+      - All subsequent "user" messages = environment observations o_t
+      - "assistant" messages may contain <execute>code</execute> blocks
+
+    Args:
+        row: dict with 'id' and 'conversations' keys (HuggingFace row format)
+             OR legacy dict with 'conversations' and 'reward' keys (synthetic/JSONL)
+
+    Returns:
+        Trajectory or None if unparseable
+    """
+    traj_id = row.get("id", "unknown")
+    convos = row.get("conversations", [])
+
+    if len(convos) < 2:
         return None
 
-    context = convos[0]["content"]  # Initial user prompt
+    # Extract system prompt if present
+    system_prompt = ""
+    start_idx = 0
+    if convos[0]["role"] == "system":
+        system_prompt = convos[0]["content"]
+        start_idx = 1
+
+    # First user message = initial task context
+    if start_idx >= len(convos) or convos[start_idx]["role"] != "user":
+        return None
+
+    initial_context = convos[start_idx]["content"]
+    start_idx += 1
+
+    # Parse alternating assistant / user turns
     steps = []
-
-    i = 1
-    while i + 1 < len(convos):
-        action_msg = convos[i]
-        obs_msg = convos[i + 1]
-
-        if action_msg.get("role") != "assistant":
+    i = start_idx
+    while i < len(convos):
+        if convos[i]["role"] != "assistant":
             i += 1
             continue
 
-        action_text = action_msg["content"]
-        obs_text = obs_msg["content"] if obs_msg.get("role") in ("environment", "tool") else ""
+        action_full = convos[i]["content"]
+        action_code = extract_code_blocks(action_full)
 
-        tau = classify_action(action_text)
-        steps.append(TrajectoryStep(action_text, obs_text, tau))
-        i += 2
+        # Next user message is the environment observation (if present)
+        observation = ""
+        if i + 1 < len(convos) and convos[i + 1]["role"] == "user":
+            observation = convos[i + 1]["content"]
+            i += 2
+        else:
+            i += 1  # Terminal assistant message with no following observation
+
+        tau = classify_action(action_code)
+        steps.append(TrajectoryStep(
+            action_text=action_full,
+            action_code=action_code,
+            observation_text=observation,
+            tau=tau,
+        ))
 
     if not steps:
         return None
 
-    reward = float(raw.get("reward", 0))
-    return Trajectory(context, steps, reward)
+    # Reward: prefer explicit field (synthetic data), otherwise infer
+    if "reward" in row:
+        reward = float(row["reward"])
+    else:
+        reward = infer_reward(convos)
+
+    return Trajectory(
+        id=traj_id,
+        context=initial_context,
+        system_prompt=system_prompt,
+        steps=steps,
+        reward=reward,
+    )
 
 
-def load_trajectories_from_jsonl(filepath: str, max_count: int = None) -> List[Trajectory]:
-    """Load trajectories from a JSONL file."""
+def load_from_huggingface(max_count: int = 1000) -> List[Trajectory]:
+    """
+    Load CodeActInstruct trajectories from HuggingFace (xingyaoww/code-act).
+
+    Uses the "codeact" split (7,139 agentic trajectories).
+    The "general" split contains non-agentic conversations and is NOT used.
+
+    Requires: pip install datasets
+    """
+    from datasets import load_dataset
+
+    logger.info("Loading xingyaoww/code-act dataset from HuggingFace...")
+    dataset = load_dataset("xingyaoww/code-act", split="codeact")
+    logger.info(f"Dataset has {len(dataset)} raw trajectories")
+
     trajectories = []
-    with open(filepath, "r") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            raw = json.loads(line)
-            traj = parse_codeact_trajectory(raw)
-            if traj is not None:
-                trajectories.append(traj)
-                if max_count and len(trajectories) >= max_count:
-                    break
+    for row in dataset:
+        if len(trajectories) >= max_count:
+            break
+        traj = parse_codeact_trajectory(dict(row))
+        if traj is not None:
+            trajectories.append(traj)
+
+    logger.info(
+        f"Parsed {len(trajectories)} valid trajectories "
+        f"(success rate: {sum(t.reward for t in trajectories)/max(len(trajectories),1):.1%})"
+    )
     return trajectories
 
 
 class AgenticJEPADataset(Dataset):
     """
-    Dataset that yields trajectory steps with all required fields.
+    Dataset yielding trajectory steps with correct afterstate target boundaries.
 
-    Each item returns:
-    - pre_action_text: The full text up to and including action a_t
-                       (for afterstate target encoding)
-    - action_text: The action a_t text (for action embedding)
-    - observation_text: The observation o_t text (for SLERP fusion)
-    - post_observation_text: Full text including o_t (for value head target context)
-    - tau: Action-type weight for JEPA loss
-    - reward: Binary task success (for value head)
-    - is_terminal: Whether this is the last step
+    Each item yields:
+      context_before_action  → h_t input (Context Encoder)
+      context_after_action   → EMA afterstate target (includes action, excludes obs)
+      action_text            → Full assistant message (for action embedding)
+      observation_text       → Subsequent user/env message (for SLERP fusion)
+      tau                    → Action-type weight
+      reward                 → Binary trajectory success
+      is_terminal            → Whether this is the last step
     """
 
-    def __init__(self, trajectories: List[Trajectory], tokenizer, max_len: int = 1024):
+    def __init__(self, trajectories: List[Trajectory], max_len: int = 1024):
         self.samples = []
-        self.tokenizer = tokenizer
-        self.max_len = max_len
+        # max_len in chars (approx): truncate from the left to keep recent context
+        self._max_chars = max_len * 4
 
         for traj in trajectories:
-            cumulative_context = traj.context
-            for step_idx, step in enumerate(traj.steps):
-                # === AFTERSTATE TARGET BOUNDARY ===
-                # pre_action_text: everything up to AND INCLUDING the current action
-                pre_action_text = cumulative_context + "\n" + step.action_text
+            # Build the cumulative context string, starting with system + initial task
+            base = ""
+            if traj.system_prompt:
+                base += f"[System] {traj.system_prompt}\n"
+            base += f"[User] {traj.context}\n"
 
-                # post_observation_text: everything INCLUDING the observation
-                post_obs_text = pre_action_text + "\n" + step.observation_text
+            cumulative_before = base  # context BEFORE the first action
+
+            for step_idx, step in enumerate(traj.steps):
+                # context_after_action: includes current action, excludes observation
+                cumulative_after = cumulative_before + f"[Assistant] {step.action_text}\n"
 
                 self.samples.append({
-                    "pre_action_text": pre_action_text,
+                    # Core JEPA fields
+                    "context_before_action": cumulative_before[-self._max_chars:],
+                    "context_after_action": cumulative_after[-self._max_chars:],
+                    # Action fields
                     "action_text": step.action_text,
-                    "observation_text": step.observation_text,
-                    "post_observation_text": post_obs_text,
+                    "action_code": step.action_code,
+                    # Observation for SLERP fusion
+                    "observation_text": step.observation_text or "(no observation)",
+                    # Labels
                     "tau": step.tau,
                     "reward": traj.reward,
                     "is_terminal": (step_idx == len(traj.steps) - 1),
@@ -159,62 +257,67 @@ class AgenticJEPADataset(Dataset):
                     "total_steps": len(traj.steps),
                 })
 
-                # Update cumulative context for next step
-                cumulative_context = post_obs_text
+                # Advance cumulative context to include observation for next step
+                if step.observation_text:
+                    cumulative_before = cumulative_after + f"[Observation] {step.observation_text}\n"
+                else:
+                    cumulative_before = cumulative_after
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        sample = self.samples[idx]
-
-        # Return raw text and metadata; encoding happens in model forward pass
+        s = self.samples[idx]
         return {
-            "pre_action_text": sample["pre_action_text"],
-            "action_text": sample["action_text"],
-            "observation_text": sample["observation_text"],
-            "post_observation_text": sample["post_observation_text"],
-            "tau": torch.tensor(sample["tau"], dtype=torch.float32),
-            "reward": torch.tensor(sample["reward"], dtype=torch.float32),
-            "is_terminal": sample["is_terminal"],
-            "step_idx": sample["step_idx"],
-            "total_steps": sample["total_steps"],
+            "context_before_action": s["context_before_action"],
+            "context_after_action": s["context_after_action"],
+            "action_text": s["action_text"],
+            "observation_text": s["observation_text"],
+            "tau": torch.tensor(s["tau"], dtype=torch.float32),
+            "reward": torch.tensor(s["reward"], dtype=torch.float32),
+            "is_terminal": s["is_terminal"],
+            "step_idx": s["step_idx"],
+            "total_steps": s["total_steps"],
         }
 
 
-def collate_fn(batch):
-    """Custom collate to handle variable-length text fields."""
+def collate_fn(batch: list) -> dict:
+    """Custom collation: text fields stay as lists, tensors get stacked."""
     return {
-        "pre_action_text": [item["pre_action_text"] for item in batch],
-        "action_text": [item["action_text"] for item in batch],
-        "observation_text": [item["observation_text"] for item in batch],
-        "post_observation_text": [item["post_observation_text"] for item in batch],
-        "tau": torch.stack([item["tau"] for item in batch]),
-        "reward": torch.stack([item["reward"] for item in batch]),
-        "is_terminal": [item["is_terminal"] for item in batch],
-        "step_idx": [item["step_idx"] for item in batch],
-        "total_steps": [item["total_steps"] for item in batch],
+        "context_before_action": [b["context_before_action"] for b in batch],
+        "context_after_action": [b["context_after_action"] for b in batch],
+        "action_text": [b["action_text"] for b in batch],
+        "observation_text": [b["observation_text"] for b in batch],
+        "tau": torch.stack([b["tau"] for b in batch]),
+        "reward": torch.stack([b["reward"] for b in batch]),
+        "is_terminal": [b["is_terminal"] for b in batch],
+        "step_idx": [b["step_idx"] for b in batch],
+        "total_steps": [b["total_steps"] for b in batch],
     }
 
 
-def create_dataloaders(trajectories: List[Trajectory], tokenizer,
-                       val_split: float = 0.1, batch_size: int = 16,
-                       max_len: int = 1024):
-    """Split trajectories into train/val and create DataLoaders."""
-    n_val = max(1, int(len(trajectories) * val_split))
-    val_trajs = trajectories[-n_val:]
-    train_trajs = trajectories[:-n_val]
+def create_dataloaders(
+    trajectories: List[Trajectory],
+    val_split: float = 0.1,
+    batch_size: int = 16,
+    max_len: int = 1024,
+):
+    """Shuffle, split, and create train/val DataLoaders."""
+    random.shuffle(trajectories)
+    split_idx = max(1, int(len(trajectories) * (1 - val_split)))
+    train_trajs = trajectories[:split_idx]
+    val_trajs = trajectories[split_idx:]
 
-    train_ds = AgenticJEPADataset(train_trajs, tokenizer, max_len)
-    val_ds = AgenticJEPADataset(val_trajs, tokenizer, max_len)
+    train_ds = AgenticJEPADataset(train_trajs, max_len=max_len)
+    val_ds = AgenticJEPADataset(val_trajs, max_len=max_len)
 
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
-        collate_fn=collate_fn, drop_last=True
+        collate_fn=collate_fn, drop_last=True,
     )
     val_loader = DataLoader(
         val_ds, batch_size=batch_size, shuffle=False,
-        collate_fn=collate_fn
+        collate_fn=collate_fn,
     )
 
     return train_loader, val_loader

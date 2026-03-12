@@ -68,9 +68,14 @@ def value_loss(v_fused: torch.Tensor, v_afterstate: torch.Tensor,
 
 
 def compute_total_loss(l_jepa: torch.Tensor, l_value: torch.Tensor,
-                       n_steps: torch.Tensor, lambda_jepa: float,
+                       ponder_cost: torch.Tensor, lambda_jepa: float,
                        lambda_v: float, lambda_ponder: float) -> torch.Tensor:
-    """Compute weighted total loss."""
-    ponder = n_steps.mean()
-    total = lambda_jepa * l_jepa + lambda_v * l_value + lambda_ponder * ponder
+    """
+    Compute weighted total loss.
+
+    ponder_cost must be a differentiable scalar — specifically the sum of
+    per-step mean halting probabilities from the ACT loop. Do NOT pass the
+    discrete n_steps count here; it is not differentiable.
+    """
+    total = lambda_jepa * l_jepa + lambda_v * l_value + lambda_ponder * ponder_cost
     return total

@@ -152,6 +152,12 @@ class AgenticJEPATrainer:
 
         # === Step 3: Afterstate Predictor (ACT) ===
         as_t, n_steps, halt_probs = self.predictor(h_t, action_embed)
+        # Differentiable ponder cost: sum of per-step mean halting probabilities.
+        # n_steps is computed from non-differentiable boolean comparisons (`.float()`
+        # of `cumulative_halt < 1.0`), so it cannot carry gradients when
+        # lambda_ponder > 0 in Stage 2. The halt probabilities themselves are
+        # differentiable through sigmoid and are what ACT prescribes as the ponder signal.
+        ponder_cost = sum(p.squeeze(-1).mean() for p in halt_probs)
 
         # === Step 4: EMA target (stop-gradient) ===
         # context_after_action includes the action but NOT the observation —
@@ -179,7 +185,7 @@ class AgenticJEPATrainer:
 
         # === Step 11: Total loss ===
         total = compute_total_loss(
-            l_jepa, l_value, n_steps,
+            l_jepa, l_value, ponder_cost,
             lambda_jepa, lambda_v, lambda_ponder
         )
 
@@ -369,6 +375,22 @@ class AgenticJEPATrainer:
             avg_loss = epoch_loss / max(n_steps, 1)
             epoch_losses.append(avg_loss)
             logger.info(f"Talker epoch {epoch} | CE Loss: {avg_loss:.4f}")
+
+        # Restore trainable parameters that were frozen for Talker training.
+        # Without this, any further training calls after train_talker() would
+        # silently produce zero gradients for the predictor, slerp_fusion, and value_head.
+        for p in self.predictor.parameters():
+            p.requires_grad = True
+        for p in self.slerp_fusion.parameters():
+            p.requires_grad = True
+        for p in self.value_head.parameters():
+            p.requires_grad = True
+        if not self.config.freeze_encoder:
+            for p in self.encoder.parameters():
+                p.requires_grad = True
+        else:
+            for p in self.encoder.projection.parameters():
+                p.requires_grad = True
 
         return epoch_losses
 

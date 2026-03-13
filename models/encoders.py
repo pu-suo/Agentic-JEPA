@@ -44,7 +44,7 @@ class TextEncoder(nn.Module):
             return_tensors="pt",
             padding=True,
             truncation=True,
-            max_length=1024
+            max_length=512  # CodeBERT (RoBERTa-base) max_position_embeddings=514 → 512 usable
         ).to(device)
 
         backbone_requires_grad = any(p.requires_grad for p in self.backbone.parameters())

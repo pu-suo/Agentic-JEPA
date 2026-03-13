@@ -61,5 +61,5 @@ class AgenticJEPAConfig:
 
     # === Data ===
     num_trajectories: int = 1000
-    max_seq_len: int = 1024
+    max_seq_len: int = 512
     val_split: float = 0.1

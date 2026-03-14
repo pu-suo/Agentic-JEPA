@@ -41,6 +41,7 @@ class AgenticJEPAConfig:
     stage0_plateau_epsilon: float = 0.005
     stage1_alpha_threshold: float = 0.1  # Mean α_t must exceed this
     stage1_jepa_tolerance: float = 0.05  # JEPA loss must be within 5% of Stage 0 plateau
+    stage1_max_evals: int = 200           # Time-based fallback: advance to Stage 2 after this many evals
 
     # === Training ===
     batch_size: int = 16
@@ -50,7 +51,7 @@ class AgenticJEPAConfig:
     gradient_clip: float = 1.0
 
     # === Talker ===
-    talker_layers: int = 2
+    talker_layers: int = 4
     talker_heads: int = 4
     talker_max_tokens: int = 512
 

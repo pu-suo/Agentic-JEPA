@@ -27,6 +27,7 @@ class CurriculumState:
     stage0_eval_history: List[float] = field(default_factory=list)
     stage1_alpha_history: List[float] = field(default_factory=list)
     stage1_jepa_history: List[float] = field(default_factory=list)
+    stage1_eval_count: int = 0
 
 
 class CurriculumController:
@@ -39,7 +40,7 @@ class CurriculumController:
         if self.state.current_stage == 0:
             return 1.0, 0.0, 0.0
         elif self.state.current_stage == 1:
-            return 1.0, 0.01, 0.0
+            return 1.0, 0.05, 0.0
         else:  # Stage 2
             return 1.0, 0.1, 0.01
 
@@ -99,16 +100,20 @@ class CurriculumController:
         self.state.stage1_alpha_history.append(mean_alpha)
         self.state.stage1_jepa_history.append(jepa_loss)
 
+        self.state.stage1_eval_count += 1
+
         alpha_ok = mean_alpha > self.config.stage1_alpha_threshold
         jepa_ok = jepa_loss < self.state.stage0_plateau_value * (
             1 + self.config.stage1_jepa_tolerance
         )
+        time_ok = self.state.stage1_eval_count >= self.config.stage1_max_evals
 
-        if alpha_ok and jepa_ok:
+        if (alpha_ok and jepa_ok) or time_ok:
             self.state.current_stage = 2
+            reason = "α threshold met" if alpha_ok else f"max evals ({self.config.stage1_max_evals}) reached"
             logger.info(
                 f"=== ADVANCING TO STAGE 2 === "
-                f"(α={mean_alpha:.3f}, JEPA={jepa_loss:.4f})"
+                f"(α={mean_alpha:.3f}, JEPA={jepa_loss:.4f}, reason: {reason})"
             )
             return True
         return False

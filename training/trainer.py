@@ -4,10 +4,10 @@ Main training loop for Agentic JEPA.
 Per-step training flow:
   1. Encode context_before_action with Context Encoder → h_t
   2. Encode action_text with Context Encoder → action_embed
-  3. Run Afterstate Predictor (ACT) → as_t, n_steps, halt_probs
-  4. Encode context_after_action with EMA Target Encoder → ema_target (stop-gradient)
-     NOTE: context_after_action includes the action but NOT the observation.
-           This is the correct afterstate target boundary.
+  3. Run Afterstate Predictor (ACT) → as_t, n_steps, halt_probs, remainders
+  4. Encode action_text with EMA Target Encoder → ema_target (stop-gradient)
+     NOTE: action_text prevents degeneracy where Enc(long_context_before) ≈
+           Enc(long_context_before + action) due to CLS token insensitivity.
   5. Compute JEPA loss: cosine_distance(as_t, sg[ema_target]) weighted by tau
   6. Run Value Head on as_t → v_afterstate
   7. Encode observation_text with Context Encoder → obs_embed
@@ -151,19 +151,22 @@ class AgenticJEPATrainer:
         action_embed = self.encoder(batch["action_text"])      # (B, d)
 
         # === Step 3: Afterstate Predictor (ACT) ===
-        as_t, n_steps, halt_probs = self.predictor(h_t, action_embed)
-        # Differentiable ponder cost: sum of per-step mean halting probabilities.
-        # n_steps is computed from non-differentiable boolean comparisons (`.float()`
-        # of `cumulative_halt < 1.0`), so it cannot carry gradients when
-        # lambda_ponder > 0 in Stage 2. The halt probabilities themselves are
-        # differentiable through sigmoid and are what ACT prescribes as the ponder signal.
-        ponder_cost = sum(p.squeeze(-1).mean() for p in halt_probs)
+        as_t, n_steps, halt_probs, remainders = self.predictor(h_t, action_embed)
+        # Differentiable ponder cost using Graves (2016) ACT formulation: ρ = N + R
+        # where N = discrete step count (non-differentiable, detached) and
+        # R = remainder = 1 - Σ_{k<N} p_k (differentiable through cumulative halt probs).
+        # Gradient flows through R: minimizing R increases early halt probs → halts sooner.
+        # The previous sum(p) formulation was WRONG: it penalized large p (halt) → model
+        # learned to never halt (p→0 → always runs to K_max).
+        ponder_cost = (n_steps.detach() + remainders.squeeze(-1)).mean()
 
-        # === Step 4: EMA target (stop-gradient) ===
-        # context_after_action includes the action but NOT the observation —
-        # this is the correct afterstate target boundary.
+        # === Step 4: EMA target — encode ACTION TEXT (stop-gradient) ===
+        # JEPA task: from global state h_t, predict the latent of the action taken.
+        # Using action_text (not context_after_action) prevents the degeneracy where
+        # Enc(long_context_before) ≈ Enc(long_context_before + action) due to CLS insensitivity.
+        # The online/EMA asymmetry (same principle as BYOL) prevents representational collapse.
         with torch.no_grad():
-            ema_target = self.ema_encoder(batch["context_after_action"])  # (B, d)
+            ema_target = self.ema_encoder(batch["action_text"])  # (B, d)
 
         # === Step 5: JEPA loss ===
         l_jepa = jepa_loss(as_t, ema_target, tau)
@@ -235,9 +238,9 @@ class AgenticJEPATrainer:
 
             h_t = self.encoder(batch["context_before_action"])
             action_embed = self.encoder(batch["action_text"])
-            as_t, n_steps, _ = self.predictor(h_t, action_embed)
+            as_t, n_steps, _, _ = self.predictor(h_t, action_embed)
 
-            ema_target = self.ema_encoder(batch["context_after_action"])
+            ema_target = self.ema_encoder(batch["action_text"])
             l_jepa = jepa_loss(as_t, ema_target, tau)
 
             obs_embed = self.encoder(batch["observation_text"])
@@ -341,7 +344,7 @@ class AgenticJEPATrainer:
                 with torch.no_grad():
                     h_t = self.encoder(batch["context_before_action"])
                     action_embed = self.encoder(batch["action_text"])
-                    as_t, _, _ = self.predictor(h_t, action_embed)
+                    as_t, _, _, _ = self.predictor(h_t, action_embed)
 
                 # Tokenize target actions
                 target_enc = tokenizer(

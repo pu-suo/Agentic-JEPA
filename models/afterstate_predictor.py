@@ -62,6 +62,7 @@ class AfterstatePredictor(nn.Module):
             as_t: (batch, d_model) afterstate on S^(d-1)
             n_steps: (batch,) number of ponder steps taken per sample
             halt_probs: list of (batch, 1) halting probabilities per step
+            remainders: (batch, 1) ACT remainder term R = 1 - Σ_{k<N} p_k
         """
         batch_size = h_t.shape[0]
         device = h_t.device
@@ -118,4 +119,4 @@ class AfterstatePredictor(nn.Module):
         as_t = l2_normalize(weighted_state)
         n_steps = n_updates.squeeze(-1)
 
-        return as_t, n_steps, halt_probs_list
+        return as_t, n_steps, halt_probs_list, remainders

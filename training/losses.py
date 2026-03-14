@@ -6,7 +6,7 @@ The unified loss is:
 
 Where:
 - L_JEPA = cosine distance between predicted afterstate and EMA target
-           of the PRE-OBSERVATION state
+           of the ACTION TEXT
 - L_V = MSE between V(h_{t+1}) and empirical return R_t
          where h_{t+1} is the POST-SLERP fused state
 - N_steps = ponder step count from ACT (scalar per sample)
@@ -25,8 +25,10 @@ def jepa_loss(predicted_afterstate: torch.Tensor,
     Args:
         predicted_afterstate: (batch, d) predictor output, L2-normalized
         ema_target: (batch, d) stop-gradient EMA target, L2-normalized
-                    THIS IS THE ENCODING OF THE PRE-OBSERVATION STATE
-                    (context up to and including action a_t, EXCLUDING o_t)
+                    THIS IS THE ENCODING OF THE ACTION TEXT via the EMA encoder.
+                    The predictor learns: given state h_t, predict EMA_Enc(action_text).
+                    Using action_text (not context_after_action) prevents degeneracy
+                    where CLS(long_context_before) ≈ CLS(long_context_before + action).
         tau: (batch,) action-type weight. ~1.0 for internal, ~0.1 for external
 
     Returns:
@@ -73,9 +75,10 @@ def compute_total_loss(l_jepa: torch.Tensor, l_value: torch.Tensor,
     """
     Compute weighted total loss.
 
-    ponder_cost must be a differentiable scalar — specifically the sum of
-    per-step mean halting probabilities from the ACT loop. Do NOT pass the
-    discrete n_steps count here; it is not differentiable.
+    ponder_cost must be a differentiable scalar using the Graves (2016) ACT
+    formulation: mean(N.detach() + R), where N is the discrete step count and
+    R is the remainder term (differentiable). Do NOT pass the raw discrete
+    n_steps count here; it is not differentiable.
     """
     total = lambda_jepa * l_jepa + lambda_v * l_value + lambda_ponder * ponder_cost
     return total

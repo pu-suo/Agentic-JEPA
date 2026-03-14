@@ -290,10 +290,13 @@ class MCTSPlanner:
             trace["step"] = step
             traces.append(trace)
 
+            action_preview = trace['selected_action'][:50] if trace['selected_action'] else 'None'
+            alpha_str = f"{trace['alpha']:.3f}" if trace['alpha'] is not None else 'N/A'
+            delta_str = f"{trace['delta']:.4f}" if trace['delta'] is not None else 'N/A'
             logger.info(
-                f"Step {step}: action={trace['selected_action'][:50] if trace['selected_action'] else None}... "
-                f"| α={trace['alpha']:.3f if trace['alpha'] is not None else 'N/A'} "
-                f"| Δ={trace['delta']:.4f if trace['delta'] is not None else 'N/A'}"
+                f"Step {step}: action={action_preview!r}... "
+                f"| α={alpha_str} "
+                f"| Δ={delta_str}"
             )
 
         return traces

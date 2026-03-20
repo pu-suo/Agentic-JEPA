@@ -82,8 +82,14 @@ class CurriculumController:
         recent = self.state.stage0_eval_history[-self.config.stage0_plateau_patience:]
         older = self.state.stage0_eval_history[-(self.config.stage0_plateau_patience + 1)]
 
-        improvements = [older - r for r in recent]
-        if all(imp < self.config.stage0_plateau_epsilon for imp in improvements):
+        # FIX: Check absolute difference to detect a true plateau (flatline),
+        # ignoring both massive drops and massive increases (LoRA expansion).
+        differences = [abs(older - r) for r in recent]
+
+        # Also ensure the recent window itself is highly stable (low variance).
+        recent_variance = max(recent) - min(recent)
+
+        if all(diff < self.config.stage0_plateau_epsilon for diff in differences) and (recent_variance < self.config.stage0_plateau_epsilon):
             self.state.stage0_plateau_value = min(recent)
             self.state.current_stage = 1
             logger.info(

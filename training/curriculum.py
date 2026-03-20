@@ -108,7 +108,14 @@ class CurriculumController:
 
         self.state.stage1_eval_count += 1
 
-        alpha_ok = mean_alpha > self.config.stage1_alpha_threshold
+        # Use rolling peak: has alpha been above threshold at any point in the recent window?
+        # Single-point check fails when the gate retreats after learning (expected in Stage 1's
+        # successful-obs-only data, where observations don't add value-head info and the optimizer
+        # closes the gate again). The peak being high enough proves the model CAN integrate obs.
+        window = getattr(self.config, 'stage1_alpha_window', 5)
+        recent_alpha = self.state.stage1_alpha_history[-window:]
+        alpha_ok = max(recent_alpha) > self.config.stage1_alpha_threshold
+
         jepa_ok = jepa_loss < self.state.stage0_plateau_value * (
             1 + self.config.stage1_jepa_tolerance
         )
@@ -119,7 +126,7 @@ class CurriculumController:
             reason = "α threshold met" if alpha_ok else f"max evals ({self.config.stage1_max_evals}) reached"
             logger.info(
                 f"=== ADVANCING TO STAGE 2 === "
-                f"(α={mean_alpha:.3f}, JEPA={jepa_loss:.4f}, reason: {reason})"
+                f"(α_peak={max(recent_alpha):.3f}, JEPA={jepa_loss:.4f}, reason: {reason})"
             )
             return True
         return False

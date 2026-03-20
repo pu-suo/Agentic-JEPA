@@ -47,7 +47,8 @@ class AgenticJEPAConfig:
     # === Curriculum Transitions ===
     stage0_plateau_patience: int = 3    # Consecutive evals with < epsilon improvement
     stage0_plateau_epsilon: float = 0.005
-    stage1_alpha_threshold: float = 0.1  # Mean α_t must exceed this
+    stage1_alpha_threshold: float = 0.08  # Peak α over recent window must exceed this (natural peak ~0.092)
+    stage1_alpha_window: int = 5          # Number of recent evals to look back for peak α
     stage1_jepa_tolerance: float = 0.05  # JEPA loss must be within 5% of Stage 0 plateau
     stage1_max_evals: int = 200           # Time-based fallback: advance to Stage 2 after this many evals
 

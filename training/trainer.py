@@ -5,18 +5,19 @@ Per-step training flow:
   1. Encode context_before_action with Context Encoder → h_t
   2. Encode action_text with Context Encoder → action_embed
   3. Run Afterstate Predictor (ACT) → as_t, n_steps, halt_probs, remainders
-  4. Encode action_text with EMA Target Encoder → ema_target (stop-gradient)
-     NOTE: action_text prevents degeneracy where Enc(long_context_before) ≈
-           Enc(long_context_before + action) due to CLS token insensitivity.
+  4. Encode context_after_action with EMA Target Encoder → ema_target (stop-gradient)
+     context_after_action = context_before_action + action (pre-observation afterstate target)
   5. Compute JEPA loss: cosine_distance(as_t, sg[ema_target]) weighted by tau
+     Gradients flow: L_JEPA → as_t → P_θ → h_t → E_θ (LoRA layers)
   6. Run Value Head on as_t → v_afterstate
   7. Encode observation_text with Context Encoder → obs_embed
   8. Run Gated SLERP: h_{t+1}, alpha = SLERP(as_t, obs_embed)
   9. Run Value Head on h_{t+1} → v_fused
   10. Compute Value loss: dual MSE on (v_fused, v_afterstate, reward)
-  11. Compute total loss with curriculum weights
-  12. Backward, clip gradients, optimizer step
-  13. EMA update
+  11. Compute variance regularization on h_t (collapse prevention, active when use_lora=True)
+  12. Compute total loss with curriculum weights
+  13. Backward, clip gradients, optimizer step
+  14. EMA update (LoRA weights only)
 """
 import logging
 from typing import Dict, List, Optional
@@ -30,7 +31,7 @@ from models.encoders import TextEncoder, create_ema_encoder
 from models.afterstate_predictor import AfterstatePredictor
 from models.slerp_fusion import GatedSLERPFusion
 from models.value_head import LatentValueHead
-from training.losses import jepa_loss, value_loss, compute_total_loss
+from training.losses import jepa_loss, value_loss, compute_total_loss, variance_regularization
 from training.curriculum import CurriculumController
 from utils.ema import update_ema
 
@@ -47,6 +48,12 @@ class AgenticJEPATrainer:
             model_name=config.encoder_name,
             d_model=config.d_model,
             freeze=config.freeze_encoder,
+            use_lora=config.use_lora,
+            lora_r=config.lora_r,
+            lora_alpha=config.lora_alpha,
+            lora_target_modules=config.lora_target_modules,
+            lora_dropout=config.lora_dropout,
+            lora_bias=config.lora_bias,
         ).to(device)
 
         self.ema_encoder = create_ema_encoder(self.encoder).to(device)
@@ -77,13 +84,19 @@ class AgenticJEPATrainer:
             list(self.predictor.parameters())
             + list(self.slerp_fusion.parameters())
             + list(self.value_head.parameters())
+            + list(self.encoder.projection.parameters())  # always trainable
         )
-        # Include encoder projection if not frozen
-        if not config.freeze_encoder:
-            trainable_params += list(self.encoder.parameters())
-        else:
-            # Projection head is always trainable even when backbone is frozen
-            trainable_params += list(self.encoder.projection.parameters())
+        if config.use_lora:
+            # Add only the LoRA adapter weights from the encoder backbone
+            trainable_params += [
+                p for n, p in self.encoder.named_parameters()
+                if 'lora_' in n and p.requires_grad
+            ]
+        elif not config.freeze_encoder:
+            # Full fine-tuning fallback (ablation: use_lora=False, freeze_encoder=False)
+            trainable_params += [
+                p for p in self.encoder.backbone.parameters() if p.requires_grad
+            ]
 
         self.optimizer = torch.optim.AdamW(
             trainable_params, lr=config.learning_rate
@@ -152,21 +165,20 @@ class AgenticJEPATrainer:
 
         # === Step 3: Afterstate Predictor (ACT) ===
         as_t, n_steps, halt_probs, remainders = self.predictor(h_t, action_embed)
-        # Differentiable ponder cost using Graves (2016) ACT formulation: ρ = N + R
-        # where N = discrete step count (non-differentiable, detached) and
-        # R = remainder = 1 - Σ_{k<N} p_k (differentiable through cumulative halt probs).
-        # Gradient flows through R: minimizing R increases early halt probs → halts sooner.
-        # The previous sum(p) formulation was WRONG: it penalized large p (halt) → model
-        # learned to never halt (p→0 → always runs to K_max).
-        ponder_cost = (n_steps.detach() + remainders.squeeze(-1)).mean()
+        # Fully differentiable ponder cost: sum of per-step mean halting probabilities.
+        # Strong gradient to all halting units drives variable-depth computation.
+        # The Graves (2016) N.detach() + R formulation was tried but collapsed to K_max
+        # because the detached N provides no gradient and R alone is too weak a signal.
+        ponder_cost = sum(p.mean() for p in halt_probs)
 
-        # === Step 4: EMA target — encode ACTION TEXT (stop-gradient) ===
-        # JEPA task: from global state h_t, predict the latent of the action taken.
-        # Using action_text (not context_after_action) prevents the degeneracy where
-        # Enc(long_context_before) ≈ Enc(long_context_before + action) due to CLS insensitivity.
-        # The online/EMA asymmetry (same principle as BYOL) prevents representational collapse.
+        # === Step 4: EMA target — encode CONTEXT_AFTER_ACTION (stop-gradient) ===
+        # JEPA target = EMA encoding of the pre-observation afterstate:
+        # context_after_action = context_before_action + action text (excludes observation).
+        # The predictor must learn: given h_t (state), predict where the world-state
+        # lands on S^(d-1) after action a_t is applied.
+        # Requires LoRA-adapted encoder to be sensitive to the appended action text.
         with torch.no_grad():
-            ema_target = self.ema_encoder(batch["action_text"])  # (B, d)
+            ema_target = self.ema_encoder(batch["context_after_action"])  # (B, d)
 
         # === Step 5: JEPA loss ===
         l_jepa = jepa_loss(as_t, ema_target, tau)
@@ -186,11 +198,21 @@ class AgenticJEPATrainer:
         # === Step 10: Value loss ===
         l_value = value_loss(v_fused, v_afterstate, reward)
 
-        # === Step 11: Total loss ===
+        # === Step 11: Variance regularization (collapse prevention) ===
+        # Applied to h_t (live encoder output) so gradients flow into LoRA layers.
+        # Fixed weight of 0.01 across all curriculum stages when use_lora=True.
+        if self.config.use_lora:
+            l_var = variance_regularization(h_t)
+        else:
+            l_var = torch.zeros(1, device=self.device)
+
+        # === Step 12: Total loss ===
         total = compute_total_loss(
             l_jepa, l_value, ponder_cost,
             lambda_jepa, lambda_v, lambda_ponder
         )
+        if self.config.use_lora:
+            total = total + 0.01 * l_var
 
         # === Step 12: Backward + gradient clip + optimizer step ===
         total.backward()
@@ -211,6 +233,7 @@ class AgenticJEPATrainer:
             "loss_total": total.item(),
             "loss_jepa": l_jepa.item(),
             "loss_value": l_value.item(),
+            "loss_var": l_var.item(),
             "ponder_steps": n_steps.mean().item(),
             "mean_alpha": alpha.mean().item(),
             "lambda_jepa": lambda_jepa,
@@ -240,7 +263,7 @@ class AgenticJEPATrainer:
             action_embed = self.encoder(batch["action_text"])
             as_t, n_steps, _, _ = self.predictor(h_t, action_embed)
 
-            ema_target = self.ema_encoder(batch["action_text"])
+            ema_target = self.ema_encoder(batch["context_after_action"])
             l_jepa = jepa_loss(as_t, ema_target, tau)
 
             obs_embed = self.encoder(batch["observation_text"])
@@ -388,11 +411,14 @@ class AgenticJEPATrainer:
             p.requires_grad = True
         for p in self.value_head.parameters():
             p.requires_grad = True
-        if not self.config.freeze_encoder:
-            for p in self.encoder.parameters():
-                p.requires_grad = True
-        else:
-            for p in self.encoder.projection.parameters():
+        for p in self.encoder.projection.parameters():
+            p.requires_grad = True
+        if self.config.use_lora:
+            for n, p in self.encoder.named_parameters():
+                if 'lora_' in n:
+                    p.requires_grad = True
+        elif not self.config.freeze_encoder:
+            for p in self.encoder.backbone.parameters():
                 p.requires_grad = True
 
         return epoch_losses

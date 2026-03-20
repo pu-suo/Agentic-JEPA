@@ -14,12 +14,19 @@ Inference loop per decision step:
   2. For each, run Afterstate Predictor → as_t^(k)
   3. Evaluate with Value Head → V(as_t^(k))
   4. Select highest-value action
-  5. Decode via Talker with AST validation + retries
-  6. If all retries fail → latent backtrack
-  7. Execute in environment, receive observation
-  8. Run SLERP Fusion → h_{t+1}
-  9. Compute surprise Δ_t = V(h_{t+1}) - V(as_t)
-  10. If Δ_t < delta_fatal → backtrack
+  5. Execute best_action DIRECTLY (Talker bypassed — see NON-NEGOTIABLE note below)
+  6. Receive observation from environment
+  7. Run SLERP Fusion → h_{t+1}
+  8. Compute surprise Δ_t = V(h_{t+1}) - V(as_t)
+  9. If Δ_t < delta_fatal → backtrack
+
+NON-NEGOTIABLE: The selected action string is executed directly without Talker
+re-generation. The action string is already known (from the vocabulary or
+gt_action); routing it through the Talker is lossy — the Talker may produce a
+different or syntactically invalid string, triggering false backtracks even when
+the planning was correct. The Talker is retained for standalone generation use
+(future: generating actions from pure latent states) but MUST NOT be used in
+the plan_and_act loop.
 """
 import logging
 import random
@@ -30,7 +37,7 @@ import torch
 from models.afterstate_predictor import AfterstatePredictor
 from models.encoders import TextEncoder
 from models.slerp_fusion import GatedSLERPFusion
-from models.talker import Talker, validate_syntax
+from models.talker import Talker
 from models.value_head import LatentValueHead
 from inference.backtracking import BacktrackingController
 from utils.math_utils import l2_normalize
@@ -157,7 +164,7 @@ class MCTSPlanner:
 
             for action_text in candidates:
                 action_embed = self.encoder([action_text])  # (1, d)
-                as_k, _, _ = self.predictor(h_t, action_embed)
+                as_k, _, _, _ = self.predictor(h_t, action_embed)  # unpack all 4 returns
                 v_k = self.value_head(as_k).item()
                 candidate_values.append(v_k)
 
@@ -178,38 +185,18 @@ class MCTSPlanner:
                 available_actions=[a for a in candidates if a != best_action],
             )
 
-            # === 5. Decode action via Talker ===
-            generated_code = None
-            syntax_ok = False
+            # === 5. Execute best_action directly (Talker bypassed) ===
+            # best_action is a known string from the action vocabulary or gt_action.
+            # It was already used to compute the latent value; execute it as-is.
+            # The Talker is NOT called here — re-generating from the latent afterstate
+            # is lossy and introduces AST-validation failures even when the plan is
+            # correct, causing false backtracks on valid strategies.
+            # (self.talker retained for standalone generation path; not used here.)
+            trace["generated_code"] = best_action
+            trace["syntax_valid"] = True
 
-            for retry in range(self.talker_retries):
-                temperature = 1.0 + retry * 0.3  # Increase temperature on retries
-                generated_code = self.talker.generate(
-                    best_as, self.tokenizer, temperature=temperature
-                )
-                if validate_syntax(generated_code):
-                    syntax_ok = True
-                    break
-                logger.debug(
-                    f"Syntax validation failed (retry {retry + 1}/"
-                    f"{self.talker_retries})"
-                )
-
-            trace["generated_code"] = generated_code
-            trace["syntax_valid"] = syntax_ok
-
-            # === 6. Syntax backtrack ===
-            if not syntax_ok:
-                logger.warning(
-                    f"All {self.talker_retries} syntax retries failed. "
-                    "Triggering latent backtrack."
-                )
-                masked_actions.append(best_action)
-                self.backtracking.pop_state()
-                continue
-
-            # === 7. Execute in environment ===
-            observation_text = observation_fn(generated_code)
+            # === 6. Execute in environment ===
+            observation_text = observation_fn(best_action)
             trace["observation"] = observation_text
 
             # === 8. SLERP Fusion ===

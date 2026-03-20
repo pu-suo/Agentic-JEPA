@@ -2,22 +2,31 @@
 Encoder modules: Context Encoder, EMA Target Encoder, Observation Encoder.
 
 All encoders output L2-normalized vectors on S^(d-1).
-The Target Encoder is an EMA copy of the Context Encoder.
+The Context Encoder uses LoRA adapters on CodeBERT for trainable representation learning.
+The EMA Target Encoder is a deepcopy whose LoRA weights are tracked via EMA (utils/ema.py).
 """
 import copy
 import torch
 import torch.nn as nn
 from transformers import AutoModel, AutoTokenizer
+from peft import LoraConfig, get_peft_model, TaskType
 from utils.math_utils import l2_normalize
 
 
 class TextEncoder(nn.Module):
     """
-    Frozen pre-trained encoder that maps text -> S^(d-1).
-    Used as the Context Encoder and Observation Encoder.
+    CodeBERT encoder with optional LoRA adapters that maps text -> S^(d-1).
+
+    Base backbone weights are always frozen. With use_lora=True, ~1M LoRA adapter
+    weights (query/value projections) are trainable and receive JEPA gradients,
+    enabling true JEPA representation learning rather than COCONUT-style static embeddings.
     """
     def __init__(self, model_name: str = "microsoft/codebert-base",
-                 d_model: int = 768, freeze: bool = True):
+                 d_model: int = 768, freeze: bool = True,
+                 use_lora: bool = False,
+                 lora_r: int = 8, lora_alpha: int = 16,
+                 lora_target_modules: tuple = ("query", "value"),
+                 lora_dropout: float = 0.05, lora_bias: str = "none"):
         super().__init__()
         self.backbone = AutoModel.from_pretrained(model_name)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -29,9 +38,22 @@ class TextEncoder(nn.Module):
         else:
             self.projection = nn.Identity()
 
-        if freeze:
-            for param in self.backbone.parameters():
-                param.requires_grad = False
+        # Always freeze base CodeBERT weights
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+
+        if use_lora:
+            # Inject trainable LoRA adapters into query/value attention projections.
+            # After get_peft_model(), only lora_A/lora_B weights have requires_grad=True.
+            lora_cfg = LoraConfig(
+                r=lora_r,
+                lora_alpha=lora_alpha,
+                target_modules=list(lora_target_modules),
+                lora_dropout=lora_dropout,
+                bias=lora_bias,
+                task_type=TaskType.FEATURE_EXTRACTION,
+            )
+            self.backbone = get_peft_model(self.backbone, lora_cfg)
 
     def forward(self, text_list: list) -> torch.Tensor:
         """
@@ -61,7 +83,13 @@ class TextEncoder(nn.Module):
 
 
 def create_ema_encoder(context_encoder: TextEncoder) -> TextEncoder:
-    """Create an EMA copy of the context encoder. All params frozen."""
+    """
+    Create an EMA copy of the context encoder. All params set requires_grad=False.
+
+    With LoRA: base CodeBERT weights are identical in both encoders (both frozen).
+    Only the LoRA adapter weights differ and evolve — update_ema() in utils/ema.py
+    tracks them by name ('lora_' in param_name), leaving frozen base weights untouched.
+    """
     ema = copy.deepcopy(context_encoder)
     for param in ema.parameters():
         param.requires_grad = False

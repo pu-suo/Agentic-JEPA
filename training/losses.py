@@ -2,18 +2,41 @@
 All loss functions for Agentic JEPA.
 
 The unified loss is:
-    L = τ(a_t) · λ_JEPA · L_JEPA + λ_V · L_V + λ_p · N_steps
+    L = τ(a_t) · λ_JEPA · L_JEPA + λ_V · L_V + λ_p · Σ(halt_probs) + 0.01 · L_var
 
 Where:
 - L_JEPA = cosine distance between predicted afterstate and EMA target
-           of the ACTION TEXT
+           of the CONTEXT_AFTER_ACTION (cumulative history including the action)
 - L_V = MSE between V(h_{t+1}) and empirical return R_t
          where h_{t+1} is the POST-SLERP fused state
-- N_steps = ponder step count from ACT (scalar per sample)
+- Σ(halt_probs) = sum of per-step mean halting probabilities (fully differentiable)
+- L_var = VICReg-style variance regularization (collapse prevention, only when use_lora=True)
 """
 import torch
 import torch.nn.functional as F
 from utils.math_utils import cosine_distance
+
+
+def variance_regularization(embeddings: torch.Tensor,
+                             gamma: float = 1.0,
+                             eps: float = 1e-4) -> torch.Tensor:
+    """
+    VICReg-style variance regularization (Bardes et al., 2022).
+
+    Penalizes dimensions whose standard deviation falls below gamma.
+    Prevents representational collapse after LoRA enables gradient flow
+    into the encoder. Applied to L2-normalized encoder outputs on S^(d-1).
+
+    Args:
+        embeddings: (batch, d) L2-normalized encoder outputs
+        gamma: target minimum std per dimension
+        eps: numerical stability term inside sqrt
+
+    Returns:
+        scalar loss (zero when all dims have std >= gamma)
+    """
+    std = torch.sqrt(embeddings.var(dim=0) + eps)   # (d,)
+    return torch.mean(torch.clamp(gamma - std, min=0.0))
 
 
 def jepa_loss(predicted_afterstate: torch.Tensor,
@@ -25,10 +48,10 @@ def jepa_loss(predicted_afterstate: torch.Tensor,
     Args:
         predicted_afterstate: (batch, d) predictor output, L2-normalized
         ema_target: (batch, d) stop-gradient EMA target, L2-normalized
-                    THIS IS THE ENCODING OF THE ACTION TEXT via the EMA encoder.
-                    The predictor learns: given state h_t, predict EMA_Enc(action_text).
-                    Using action_text (not context_after_action) prevents degeneracy
-                    where CLS(long_context_before) ≈ CLS(long_context_before + action).
+                    This is EMA_Enc(context_after_action): the cumulative context
+                    including the current action but excluding the observation.
+                    The predictor learns: given h_t, predict where the world-state
+                    lands on S^(d-1) after this action is applied.
         tau: (batch,) action-type weight. ~1.0 for internal, ~0.1 for external
 
     Returns:
@@ -75,10 +98,15 @@ def compute_total_loss(l_jepa: torch.Tensor, l_value: torch.Tensor,
     """
     Compute weighted total loss.
 
-    ponder_cost must be a differentiable scalar using the Graves (2016) ACT
-    formulation: mean(N.detach() + R), where N is the discrete step count and
-    R is the remainder term (differentiable). Do NOT pass the raw discrete
-    n_steps count here; it is not differentiable.
+    ponder_cost must be a fully differentiable scalar computed as:
+        sum(p.mean() for p in halt_probs)
+    where halt_probs is the list of per-step (batch,1) halting probability
+    tensors from the ACT loop. This formulation has strong gradients to all
+    halting units and drives variable-depth computation.
+
+    Do NOT pass the Graves (2016) N.detach() + R formulation — the detached N
+    provides no gradient and the remainder R alone is too weak, causing ACT
+    to collapse to K_max on every input.
     """
     total = lambda_jepa * l_jepa + lambda_v * l_value + lambda_ponder * ponder_cost
     return total

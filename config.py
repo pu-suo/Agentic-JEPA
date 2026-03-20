@@ -8,8 +8,16 @@ class AgenticJEPAConfig:
 
     # === Encoder ===
     encoder_name: str = "microsoft/codebert-base"  # HuggingFace model ID
-    freeze_encoder: bool = True     # Freeze the backbone; only train predictor
-    ema_decay: float = 0.998        # EMA decay rate for target encoder
+    freeze_encoder: bool = True     # Freeze base CodeBERT weights; LoRA adapters remain trainable
+    ema_decay: float = 0.998        # EMA decay rate for target encoder (LoRA weights only)
+
+    # === LoRA (Low-Rank Adaptation for CodeBERT) ===
+    use_lora: bool = True           # Inject trainable LoRA adapters into frozen backbone
+    lora_r: int = 8                 # LoRA rank (~1M trainable params on CodeBERT)
+    lora_alpha: int = 16            # LoRA scaling factor (effective scale = alpha/r = 2.0)
+    lora_target_modules: tuple = ("query", "value")  # RoBERTa attention projections
+    lora_dropout: float = 0.05
+    lora_bias: str = "none"
 
     # === Afterstate Predictor ===
     predictor_layers: int = 4       # Number of Transformer decoder layers
@@ -30,8 +38,8 @@ class AgenticJEPAConfig:
 
     # === Loss Weights (vary by curriculum stage) ===
     # Stage 0: lambda_jepa=1.0, lambda_v=0.0, lambda_ponder=0.0
-    # Stage 1: lambda_jepa=1.0, lambda_v=0.01, lambda_ponder=0.0
-    # Stage 2: lambda_jepa=1.0, lambda_v=0.1, lambda_ponder=0.01
+    # Stage 1: lambda_jepa=1.0, lambda_v=0.1,  lambda_ponder=0.0
+    # Stage 2: lambda_jepa=1.0, lambda_v=0.5,  lambda_ponder=0.01
     lambda_jepa: float = 1.0
     lambda_v: float = 0.0
     lambda_ponder: float = 0.0

@@ -224,7 +224,7 @@ class AgenticJEPADataset(Dataset):
 
     def __init__(self, trajectories: List[Trajectory], max_len: int = 1024):
         self.samples = []
-        # max_len in chars (approx): truncate from the left to keep recent context
+        # max_len in chars (approx): 4 chars per token is a conservative estimate
         self._max_chars = max_len * 4
 
         for traj in trajectories:
@@ -241,9 +241,9 @@ class AgenticJEPADataset(Dataset):
                 cumulative_after = cumulative_before + f"[Assistant] {step.action_text}\n"
 
                 self.samples.append({
-                    # Core JEPA fields
-                    "context_before_action": cumulative_before[-self._max_chars:],
-                    "context_after_action": cumulative_after[-self._max_chars:],
+                    # Core JEPA fields — truncated with prompt preservation
+                    "context_before_action": self._truncate_context(cumulative_before, base),
+                    "context_after_action": self._truncate_context(cumulative_after, base),
                     # Action fields
                     "action_text": step.action_text,
                     "action_code": step.action_code,
@@ -262,6 +262,21 @@ class AgenticJEPADataset(Dataset):
                     cumulative_before = cumulative_after + f"[Observation] {step.observation_text}\n"
                 else:
                     cumulative_before = cumulative_after
+
+    def _truncate_context(self, text: str, base_prefix: str) -> str:
+        """
+        Truncate context to _max_chars while preserving the system+task prefix.
+
+        If the full text fits, return unchanged. Otherwise, keep up to 25% of
+        the budget for the system prompt + task (the start of the string) and
+        fill the remaining 75% from the most recent context (the right side).
+        This ensures the task description is never silently dropped.
+        """
+        if len(text) <= self._max_chars:
+            return text
+        prefix_len = min(len(base_prefix), self._max_chars // 4)
+        suffix_len = self._max_chars - prefix_len
+        return text[:prefix_len] + " [...] " + text[-suffix_len:]
 
     def __len__(self):
         return len(self.samples)

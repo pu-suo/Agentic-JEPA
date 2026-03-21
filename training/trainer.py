@@ -14,6 +14,7 @@ Per-step training flow:
   8. Run Gated SLERP: h_{t+1}, alpha = SLERP(as_t, obs_embed)
   9. Run Value Head on h_{t+1} → v_fused
   10. Compute Value loss: dual MSE on (v_fused, v_afterstate, reward)
+  10b. Compute obs_utility_loss (Stage 1+): clamped info-gain reward for SLERP gate
   11. Compute variance regularization on h_t (collapse prevention, active when use_lora=True)
   12. Compute total loss with curriculum weights
   13. Backward, clip gradients, optimizer step
@@ -31,7 +32,7 @@ from models.encoders import TextEncoder, create_ema_encoder
 from models.afterstate_predictor import AfterstatePredictor
 from models.slerp_fusion import GatedSLERPFusion
 from models.value_head import LatentValueHead
-from training.losses import jepa_loss, value_loss, compute_total_loss, variance_regularization
+from training.losses import jepa_loss, value_loss, compute_total_loss, variance_regularization, obs_utility_loss
 from training.curriculum import CurriculumController
 from utils.ema import update_ema
 
@@ -198,6 +199,13 @@ class AgenticJEPATrainer:
         # === Step 10: Value loss ===
         l_value = value_loss(v_fused, v_afterstate, reward)
 
+        # === Step 10b: Observation utility loss (Stage 1+) ===
+        # Rewards the SLERP gate when incorporating the observation improves value prediction.
+        # Uses clamped information-gain formulation so the gate is never penalized for exploring —
+        # only rewarded when it helps. Penalty for unhelpful observations is already covered by
+        # the value_loss fused component above.
+        l_obs = obs_utility_loss(v_fused, v_afterstate, reward)
+
         # === Step 11: Variance regularization (collapse prevention) ===
         # Applied to h_t (live encoder output) so gradients flow into LoRA layers.
         # Fixed weight of 0.01 across all curriculum stages when use_lora=True.
@@ -213,6 +221,8 @@ class AgenticJEPATrainer:
         )
         if self.config.use_lora:
             total = total + 0.01 * l_var
+        if self.curriculum.state.current_stage >= 1:
+            total = total + self.config.lambda_obs_utility * l_obs
 
         # === Step 12: Backward + gradient clip + optimizer step ===
         total.backward()
@@ -234,6 +244,7 @@ class AgenticJEPATrainer:
             "loss_jepa": l_jepa.item(),
             "loss_value": l_value.item(),
             "loss_var": l_var.item(),
+            "loss_obs": l_obs.item(),
             "ponder_steps": n_steps.mean().item(),
             "mean_alpha": alpha.mean().item(),
             "lambda_jepa": lambda_jepa,
@@ -323,9 +334,18 @@ class AgenticJEPATrainer:
                         )
                         advanced = self.curriculum.check_transition(val_metrics)
                         if advanced:
-                            logger.info(
-                                f"Stage advanced to {self.curriculum.state.current_stage}"
-                            )
+                            new_stage = self.curriculum.state.current_stage
+                            logger.info(f"Stage advanced to {new_stage}")
+                            if new_stage == 1:
+                                # Manifold is stable after Stage 0; reset gate bias from -3.0
+                                # to -1.5 (α ≈ 0.047 → 0.18) to escape the vanishing-gradient
+                                # trap. dα/d(logit) = α(1−α): 0.045 → 0.148 (3× stronger).
+                                nn.init.constant_(
+                                    self.slerp_fusion.gate_mlp[-1].bias, -1.5
+                                )
+                                logger.info(
+                                    "SLERP gate bias reset to -1.5 (α ≈ 0.18) for Stage 1 onset"
+                                )
 
             # Check if we've completed all 3 stages
             if self.curriculum.state.current_stage == 2 and epoch > 0:

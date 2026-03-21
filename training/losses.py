@@ -92,6 +92,31 @@ def value_loss(v_fused: torch.Tensor, v_afterstate: torch.Tensor,
     return loss_fused + 0.5 * loss_as
 
 
+def obs_utility_loss(v_fused: torch.Tensor, v_afterstate: torch.Tensor,
+                     target_return: torch.Tensor) -> torch.Tensor:
+    """
+    Direct gradient signal to the SLERP gate. Only rewards, never penalizes.
+
+    Measures whether mixing in the observation improves value prediction vs the
+    afterstate baseline. Stop-gradient on baseline so gradient flows only through
+    v_fused → h_fused → SLERP → α → gate_mlp.
+
+    improvement = MSE(v_afterstate.detach(), r) - MSE(v_fused, r)
+      > 0 when fused predicts reward better → returns negative loss (reward)
+      < 0 when fused adds noise → clamped to 0 (no signal, no penalty)
+
+    The clamp is critical: Stage 1 data frequently contains observations that add
+    noise to an already-good afterstate prediction. Without the clamp, the positive
+    penalty from those cases would suppress α back to near-zero — reproducing the
+    retreat we observed. The existing value_loss already penalizes bad v_fused
+    predictions; this function adds only reward for the cases where the gate helps.
+    """
+    loss_fused = F.mse_loss(v_fused, target_return)
+    loss_as = F.mse_loss(v_afterstate.detach(), target_return)  # stop-grad baseline
+    improvement = loss_as - loss_fused
+    return -improvement.clamp(min=0)
+
+
 def compute_total_loss(l_jepa: torch.Tensor, l_value: torch.Tensor,
                        ponder_cost: torch.Tensor, lambda_jepa: float,
                        lambda_v: float, lambda_ponder: float) -> torch.Tensor:

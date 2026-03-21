@@ -43,6 +43,7 @@ class AgenticJEPAConfig:
     lambda_jepa: float = 1.0
     lambda_v: float = 0.0
     lambda_ponder: float = 0.0
+    lambda_obs_utility: float = 0.2   # Weight for obs-utility loss (Stage 1+). Amplifies gate gradient.
 
     # === Curriculum Transitions ===
     stage0_plateau_patience: int = 3    # Consecutive evals with < epsilon improvement

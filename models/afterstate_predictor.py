@@ -63,6 +63,7 @@ class AfterstatePredictor(nn.Module):
             n_steps: (batch,) number of ponder steps taken per sample
             halt_probs: list of (batch, 1) halting probabilities per step
             remainders: (batch, 1) ACT remainder term R = 1 - Σ_{k<N} p_k
+            still_running_list: list of (batch, 1) binary masks — 1.0 if sample hadn't halted yet at that step
         """
         batch_size = h_t.shape[0]
         device = h_t.device
@@ -77,6 +78,7 @@ class AfterstatePredictor(nn.Module):
         n_updates = torch.zeros(batch_size, 1, device=device)
         weighted_state = torch.zeros(batch_size, self.d_model, device=device)
         halt_probs_list = []
+        still_running_list = []
 
         for step in range(self.act_max_steps):
             # One reasoning step (Transformer pass)
@@ -91,6 +93,7 @@ class AfterstatePredictor(nn.Module):
 
             # Determine which samples are still running
             still_running = (cumulative_halt < 1.0).float()
+            still_running_list.append(still_running.detach())  # mask only, no grad flow
 
             # Which samples halt at this step
             new_halted = ((cumulative_halt + p) >= 1.0).float() * still_running
@@ -119,4 +122,4 @@ class AfterstatePredictor(nn.Module):
         as_t = l2_normalize(weighted_state)
         n_steps = n_updates.squeeze(-1)
 
-        return as_t, n_steps, halt_probs_list, remainders
+        return as_t, n_steps, halt_probs_list, remainders, still_running_list

@@ -42,7 +42,7 @@ class CurriculumController:
         elif self.state.current_stage == 1:
             return 1.0, 0.1, 0.0
         else:  # Stage 2
-            return 1.0, 0.5, 0.01
+            return 1.0, 0.5, 0.05
 
     def get_data_filter(self):
         """Return which trajectory steps to include in training."""

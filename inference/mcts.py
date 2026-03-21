@@ -164,7 +164,7 @@ class MCTSPlanner:
 
             for action_text in candidates:
                 action_embed = self.encoder([action_text])  # (1, d)
-                as_k, _, _, _ = self.predictor(h_t, action_embed)  # unpack all 4 returns
+                as_k, _, _, _, _ = self.predictor(h_t, action_embed)  # unpack all 5 returns
                 v_k = self.value_head(as_k).item()
                 candidate_values.append(v_k)
 

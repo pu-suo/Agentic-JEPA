@@ -39,7 +39,7 @@ class AgenticJEPAConfig:
     # === Loss Weights (vary by curriculum stage) ===
     # Stage 0: lambda_jepa=1.0, lambda_v=0.0, lambda_ponder=0.0
     # Stage 1: lambda_jepa=1.0, lambda_v=0.1,  lambda_ponder=0.0
-    # Stage 2: lambda_jepa=1.0, lambda_v=0.5,  lambda_ponder=0.01
+    # Stage 2: lambda_jepa=1.0, lambda_v=0.5,  lambda_ponder=0.05
     lambda_jepa: float = 1.0
     lambda_v: float = 0.0
     lambda_ponder: float = 0.0

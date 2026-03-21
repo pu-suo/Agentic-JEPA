@@ -25,6 +25,7 @@ from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from config import AgenticJEPAConfig
@@ -165,12 +166,13 @@ class AgenticJEPATrainer:
         action_embed = self.encoder(batch["action_text"])      # (B, d)
 
         # === Step 3: Afterstate Predictor (ACT) ===
-        as_t, n_steps, halt_probs, remainders = self.predictor(h_t, action_embed)
-        # Fully differentiable ponder cost: sum of per-step mean halting probabilities.
-        # Strong gradient to all halting units drives variable-depth computation.
-        # The Graves (2016) N.detach() + R formulation was tried but collapsed to K_max
-        # because the detached N provides no gradient and R alone is too weak a signal.
-        ponder_cost = sum(p.mean() for p in halt_probs)
+        as_t, n_steps, halt_probs, remainders, still_running_list = self.predictor(h_t, action_embed)
+        # Penalize continuation probability for active steps only.
+        # Minimizing (1-p_k)*s_k pushes p_k → 1 (halt early) for active steps.
+        # Phantom steps (after a sample has already halted) are masked out by
+        # still_running, preventing spurious gradients on dead steps.
+        # Previous sum(p.mean()) was backwards: minimizing p pushes toward never halting.
+        ponder_cost = sum(((1.0 - p) * s).mean() for p, s in zip(halt_probs, still_running_list))
 
         # === Step 4: EMA target — encode CONTEXT_AFTER_ACTION (stop-gradient) ===
         # JEPA target = EMA encoding of the pre-observation afterstate:
@@ -191,13 +193,23 @@ class AgenticJEPATrainer:
         obs_embed = self.encoder(batch["observation_text"])    # (B, d)
 
         # === Step 8: Gated SLERP fusion ===
-        h_fused, alpha = self.slerp_fusion(as_t, obs_embed)
+        # Detach as_t so the JEPA gradient (λ=1.0) doesn't flow into the SLERP path
+        # and dominate the value gradient (λ=0.5). This gives the gate an independent
+        # gradient channel from the value loss.
+        h_fused, alpha = self.slerp_fusion(as_t.detach(), obs_embed)
 
         # === Step 9: Value of fused state (for backtracking calibration) ===
         v_fused = self.value_head(h_fused)
 
         # === Step 10: Value loss ===
-        l_value = value_loss(v_fused, v_afterstate, reward)
+        # Stage 2: fused-only loss forces ALL reward-prediction gradients through the gate.
+        # The 0.5*MSE(V(as_t), reward) term in value_loss trains V to bypass the gate via
+        # the afterstate; removing it in Stage 2 eliminates that shortcut.
+        # Stages 0–1: dual loss keeps afterstate value calibrated for MCTS planning.
+        if self.curriculum.state.current_stage >= 2:
+            l_value = F.mse_loss(v_fused, reward)
+        else:
+            l_value = value_loss(v_fused, v_afterstate, reward)
 
         # === Step 10b: Observation utility loss (Stage 1+) ===
         # Rewards the SLERP gate when incorporating the observation improves value prediction.
@@ -272,7 +284,7 @@ class AgenticJEPATrainer:
 
             h_t = self.encoder(batch["context_before_action"])
             action_embed = self.encoder(batch["action_text"])
-            as_t, n_steps, _, _ = self.predictor(h_t, action_embed)
+            as_t, n_steps, _, _, _ = self.predictor(h_t, action_embed)
 
             ema_target = self.ema_encoder(batch["context_after_action"])
             l_jepa = jepa_loss(as_t, ema_target, tau)
@@ -387,7 +399,7 @@ class AgenticJEPATrainer:
                 with torch.no_grad():
                     h_t = self.encoder(batch["context_before_action"])
                     action_embed = self.encoder(batch["action_text"])
-                    as_t, _, _, _ = self.predictor(h_t, action_embed)
+                    as_t, _, _, _, _ = self.predictor(h_t, action_embed)
 
                 # Tokenize target actions
                 target_enc = tokenizer(

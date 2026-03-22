@@ -202,12 +202,16 @@ class AgenticJEPATrainer:
         v_fused = self.value_head(h_fused)
 
         # === Step 10: Value loss ===
-        # Stage 2: fused-only loss forces ALL reward-prediction gradients through the gate.
-        # The 0.5*MSE(V(as_t), reward) term in value_loss trains V to bypass the gate via
-        # the afterstate; removing it in Stage 2 eliminates that shortcut.
-        # Stages 0–1: dual loss keeps afterstate value calibrated for MCTS planning.
+        # Stage 2: fused-state loss is primary (forces reward gradients through SLERP gate).
+        # A 0.1-weight afterstate regularizer keeps V(as_t) calibrated for MCTS planning
+        # and the surprise metric. Without it, V(as_t) drifts during Stage 2 since it
+        # receives no direct training signal (obs_utility_loss detaches it).
+        # Stages 0–1: dual loss (1.0 fused + 0.5 afterstate) per the value_loss function.
         if self.curriculum.state.current_stage >= 2:
-            l_value = F.mse_loss(v_fused, reward)
+            # Primary: fused-state loss forces gradients through the SLERP gate
+            # Auxiliary (0.1 weight): small regularization on afterstate prevents
+            # V(as_t) drift that would corrupt the surprise metric at inference
+            l_value = F.mse_loss(v_fused, reward) + 0.1 * F.mse_loss(v_afterstate, reward)
         else:
             l_value = value_loss(v_fused, v_afterstate, reward)
 
@@ -454,6 +458,44 @@ class AgenticJEPATrainer:
                 p.requires_grad = True
 
         return epoch_losses
+
+    def save_checkpoint(self, path: str, extra: dict = None):
+        """Save all model weights, optimizer state, curriculum state, and config."""
+        checkpoint = {
+            'global_step': self.global_step,
+            'config': vars(self.config),  # dataclass to dict
+            'encoder': self.encoder.state_dict(),
+            'ema_encoder': self.ema_encoder.state_dict(),
+            'predictor': self.predictor.state_dict(),
+            'slerp_fusion': self.slerp_fusion.state_dict(),
+            'value_head': self.value_head.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+            'curriculum_state': vars(self.curriculum.state),
+        }
+        if extra:
+            checkpoint['extra'] = extra
+        torch.save(checkpoint, path)
+        logger.info(f"Checkpoint saved to {path} (step {self.global_step})")
+
+    def load_checkpoint(self, path: str):
+        """Load checkpoint and restore all state."""
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        self.encoder.load_state_dict(checkpoint['encoder'])
+        self.ema_encoder.load_state_dict(checkpoint['ema_encoder'])
+        self.predictor.load_state_dict(checkpoint['predictor'])
+        self.slerp_fusion.load_state_dict(checkpoint['slerp_fusion'])
+        self.value_head.load_state_dict(checkpoint['value_head'])
+        self.optimizer.load_state_dict(checkpoint['optimizer'])
+        self.global_step = checkpoint['global_step']
+        # Restore curriculum state
+        if 'curriculum_state' in checkpoint:
+            for k, v in checkpoint['curriculum_state'].items():
+                setattr(self.curriculum.state, k, v)
+        logger.info(
+            f"Checkpoint loaded from {path} "
+            f"(step {self.global_step}, stage {self.curriculum.state.current_stage})"
+        )
+        return checkpoint.get('extra', {})
 
     def count_parameters(self) -> Dict[str, int]:
         """Return parameter counts for each module."""

@@ -8,7 +8,7 @@
   <img src="assets/architecture_diagram.png" alt="Agentic-JEPA Architecture" width="100%"/>
 </p>
 
-> **Diagram note:** The Autoregressive Talker and Generative MCTS loop (top of diagram) represent the Phase 2 design target. In the current prototype, actions are selected from a static vocabulary and the Talker is bypassed during inference. All other components — the CodeBERT encoder, Afterstate Predictor with ACT, Gated SLERP fusion, Latent Value Head, and Surprise-triggered backtracking — are fully implemented and trained.
+> **Diagram note:** The Autoregressive Talker (top of diagram) represents a future extension. In the current system, candidate actions are proposed externally (via retrieval from the training vocabulary or from an external LLM) and scored by the latent pipeline. All other components — the CodeBERT encoder, Afterstate Predictor with ACT, Gated SLERP fusion, Latent Value Head, and Surprise-triggered backtracking — are fully implemented and trained.
 
 ---
 
@@ -75,7 +75,7 @@ Training a multi-objective latent agent requires carefully sequencing competing 
 |-------|-----------|--------------------------------------|---------------------|
 | **0 — Pure JEPA** | Stabilize the manifold. No observations, no value gradients. | 1.0, 0.0, 0.0 | JEPA val loss plateaus (< ε improvement for 3 consecutive evals) |
 | **1 — Mild Observations** | Teach the SLERP gate to open. Introduce successful observations and clamped obs-utility loss. | 1.0, 0.1, 0.0 | Peak α exceeds threshold (0.08) AND JEPA loss within 5% of Stage 0 plateau |
-| **2 — Full Stochasticity** | Introduce failure trajectories and ACT ponder penalty. Critical `as_t.detach()` before SLERP prevents JEPA gradient from crushing Value Head. | 1.0, 0.5, 0.05 | Train to convergence |
+| **2 — Full Stochasticity** | Introduce failure trajectories and ACT ponder penalty. Critical `as_t.detach()` before SLERP prevents JEPA gradient from crushing Value Head. | 1.0, 0.5, 0.025 | Train to convergence |
 
 **Stage 0** stabilizes the latent manifold using only JEPA cosine distance loss. The LoRA adapters learn to separate context states on S^(d−1) while the EMA target encoder tracks slowly. The JEPA loss rises from near-zero (where the frozen CodeBERT backbone starts with nearly identical representations) to a stable plateau around 0.12 as the LoRA adapters learn to differentiate pre- and post-action contexts:
 
@@ -113,20 +113,18 @@ Trained on 1,000 CodeActInstruct trajectories (3,661 steps, 66.7% success rate),
 
 **Calibrated Backtracking.** The Surprise Metric (Δ_t) produced a clean, well-concentrated distribution (center panel), establishing a gradient-free backtracking threshold at **−0.0794** (5th percentile). The full inference loop — encode → predict → fuse → evaluate → backtrack — runs without tensor shape mismatches or memory leaks.
 
-> **Current limitations:** Open-ended action generation is not yet functional. The Talker module is trained (final CE loss: 1.07, curve below) but produces incoherent code and is bypassed during inference in favor of a static action vocabulary. The K-way accuracy evaluation (selecting ground-truth from distractors) is designed but not yet run at scale. The inference demo uses a mock environment replaying ground-truth observations.
+> **Current limitations:** Open-ended action generation is not yet functional. The Talker module exists but is not part of the active pipeline; actions are proposed from a static vocabulary and scored by the latent pipeline. The inference demo uses a mock environment replaying ground-truth observations.
 
-<p align="center">
-  <img src="assets/talker_training_loss.png" alt="Talker Training Loss" width="60%"/>
-</p>
+**Value Head Ranking Accuracy (K-Way Test).** [Results to be added after evaluation run.]
 
 ---
 
 ## Future Roadmap
 
-1. **Autoregressive Talker integration** — train a stronger decoder to generate open-ended actions from latent states, replacing the fixed vocabulary.
-2. **Generative MCTS** — replace static action proposals with real-time latent-conditioned generation, enabling the planner to explore novel action sequences.
-3. **Secure execution sandbox** — build a containerized Python execution environment for real (not mock) environment interaction.
-4. **K-Way evaluation at scale** — run the generative ranking evaluation across the full validation set to quantify the Value Head's discriminative ability.
+1. **Hybrid Latent Critic** — integrate an external instruction-tuned LLM (e.g., DeepSeek-Coder) as the action proposer. Agentic-JEPA embeds, simulates, and scores candidate actions entirely in latent space. Zero tokens generated during evaluation.
+2. **ALFWorld evaluation** — deploy the latent MCTS loop on ALFWorld's discrete-action text environment to test the core prediction/fusion/backtracking mechanics on a real interactive benchmark.
+3. **Ablation studies** — LERP vs SLERP, fixed-depth vs ACT, with/without gradient detach barrier, with/without obs-utility loss.
+4. **Latency benchmarks** — measure per-node expansion cost of latent MCTS vs. token-based MCTS to quantify the theoretical speedup.
 
 ---
 

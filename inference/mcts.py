@@ -37,7 +37,6 @@ import torch
 from models.afterstate_predictor import AfterstatePredictor
 from models.encoders import TextEncoder
 from models.slerp_fusion import GatedSLERPFusion
-from models.talker import Talker
 from models.value_head import LatentValueHead
 from inference.backtracking import BacktrackingController
 from utils.math_utils import l2_normalize
@@ -56,10 +55,10 @@ class MCTSPlanner:
         predictor: AfterstatePredictor,
         slerp_fusion: GatedSLERPFusion,
         value_head: LatentValueHead,
-        talker: Talker,
-        tokenizer,
         action_vocabulary: List[str],
         device: torch.device,
+        talker=None,
+        tokenizer=None,
         n_branches: int = 5,
         delta_fatal: float = -0.5,
         talker_retries: int = 3,

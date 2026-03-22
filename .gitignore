@@ -28,7 +28,12 @@ env/
 *.pt
 *.ckpt
 *.bin
+*.safetensors
 checkpoints/
+
+# ML experiment outputs
+wandb/
+outputs/
 
 # macOS
 .DS_Store
@@ -40,6 +45,8 @@ checkpoints/
 .idea/
 *.swp
 *.swo
+*~
+._*
 
 # Logs
 *.log
